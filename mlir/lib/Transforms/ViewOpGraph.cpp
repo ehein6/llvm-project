@@ -92,6 +92,22 @@ struct DataFlowEdge {
   Value value;
   Node node;
   std::string port;
+  /// If set, the edge originates from this node instead of the node that
+  /// produces `value`. Used to route uses of a region op's operand through the
+  /// op's input bar.
+  std::optional<Node> source = std::nullopt;
+  /// When true, the source attaches to its `<arg...>` port (south side) rather
+  /// than its `<res...>` port. Used when `source` is an input bar.
+  bool sourceUsesArgPort = false;
+};
+
+/// The anchor node of a block's cluster and the node of its last (terminator)
+/// operation. Used to bracket a region op's input/output bars: the input bar is
+/// ordered above the anchor (top) and the output bar below the terminator
+/// (bottom).
+struct BlockNodes {
+  Node anchor;
+  Node last;
 };
 
 /// This pass generates a Graphviz dataflow visualization of an MLIR operation.
@@ -151,7 +167,9 @@ private:
   void emitAllEdgeStmts() {
     if (printDataFlowEdges) {
       for (const auto &e : dataFlowEdges) {
-        emitEdgeStmt(valueToNode[e.value], e.node, e.port, kLineStyleDataFlow);
+        Node source = e.source ? *e.source : valueToNode[e.value];
+        emitEdgeStmt(source, e.node, e.port, kLineStyleDataFlow,
+                     e.sourceUsesArgPort);
       }
     }
 
@@ -239,7 +257,11 @@ private:
 
   /// Append an edge to the list of edges.
   /// Note: Edges are written to the output stream via `emitAllEdgeStmts`.
-  void emitEdgeStmt(Node n1, Node n2, std::string port, StringRef style) {
+  /// When `sourceUsesArgPort` is true, the edge leaves the source from its
+  /// `<arg...>` port (used when the source is a region op's input bar passing a
+  /// value down into the region) instead of its `<res...>` port.
+  void emitEdgeStmt(Node n1, Node n2, std::string port, StringRef style,
+                    bool sourceUsesArgPort = false) {
     AttributeMap attrs;
     attrs["style"] = style.str();
     // Use `ltail` and `lhead` to draw edges between clusters.
@@ -250,9 +272,12 @@ private:
 
     edges.push_back(strFromOs([&](raw_ostream &os) {
       os << "v" << n1.id;
-      if (!port.empty() && !n1.clusterId)
-        // Attach edge to south compass point of the result
-        os << ":res" << port << ":s";
+      if (!port.empty() && !n1.clusterId) {
+        // Attach edge to the south compass point of the source port. An input
+        // bar exposes the value on its `<arg...>` port; every other node
+        // produces it on its `<res...>` port.
+        os << (sourceUsesArgPort ? ":arg" : ":res") << port << ":s";
+      }
       os << " -> ";
       os << "v" << n2.id;
       if (!port.empty() && !n2.clusterId)
@@ -260,6 +285,16 @@ private:
         os << ":arg" << port << ":n";
       emitAttrList(os, attrs);
     }));
+  }
+
+  /// Emit an invisible edge used only to constrain the relative rank (vertical
+  /// position) of two nodes without drawing anything.
+  void emitOrderingEdge(Node from, Node to) {
+    AttributeMap attrs;
+    attrs["style"] = "invis";
+    os << "v" << from.id << " -> v" << to.id;
+    emitAttrList(os, attrs);
+    os << ";\n";
   }
 
   /// Emit a graph. The specified builder generates the body of the graph.
@@ -301,21 +336,15 @@ private:
     return str;
   }
 
+  /// Generate the label of a region op's cluster: the op name followed by its
+  /// attributes. Each line ends with `\l` so that, together with the cluster's
+  /// `labeljust = "l"` attribute, the label is anchored in the top-left corner.
+  /// Result types are intentionally omitted here since they are shown on the
+  /// output bar's ports.
   std::string getClusterLabel(Operation *op) {
     return strFromOs([&](raw_ostream &os) {
-      // Print operation name and type.
-      os << op->getName();
-      if (printResultTypes) {
-        os << " : (";
-        std::string buf;
-        llvm::raw_string_ostream ss(buf);
-        interleaveComma(op->getResultTypes(), ss);
-        os << truncateString(buf) << ")";
-      }
-
-      // Print attributes.
+      os << op->getName() << "\\l";
       if (printAttrs) {
-        os << "\\l";
         for (const NamedAttribute &attr : op->getAttrs()) {
           os << escapeLabelString(attr.getName().getValue().str()) << ": ";
           emitMlirAttr(os, attr.getValue());
@@ -323,6 +352,34 @@ private:
         }
       }
     });
+  }
+
+  /// Emit the operand fields of a record label as a single horizontal row of
+  /// input ports, e.g. `<arg_0> %a | <arg_1> %b`.
+  void emitOperandPorts(raw_ostream &os, Operation *op) {
+    interleave(
+        op->getOperands(), os,
+        [&](Value operand) {
+          os << "<arg" << getValuePortName(operand) << "> ";
+          emitMlirOperand(os, operand);
+        },
+        "|");
+  }
+
+  /// Emit the result fields of a record label as a single horizontal row of
+  /// output ports, e.g. `<res_0> %0 i32 | <res_1> %1 i64`.
+  void emitResultPorts(raw_ostream &os, Operation *op) {
+    interleave(
+        op->getResults(), os,
+        [&](Value result) {
+          os << "<res" << getValuePortName(result) << "> ";
+          emitMlirOperand(os, result);
+          if (printResultTypes) {
+            os << " ";
+            emitMlirType(os, result.getType());
+          }
+        },
+        "|");
   }
 
   /// Generate a label for an operation.
@@ -333,11 +390,7 @@ private:
       // Print operation inputs.
       if (op->getNumOperands() > 0) {
         os << "{";
-        auto operandToPort = [&](Value operand) {
-          os << "<arg" << getValuePortName(operand) << "> ";
-          emitMlirOperand(os, operand);
-        };
-        interleave(op->getOperands(), os, operandToPort, "|");
+        emitOperandPorts(os, op);
         os << "}|";
       }
       // Print operation name and type.
@@ -356,19 +409,31 @@ private:
 
       if (op->getNumResults() > 0) {
         os << "|{";
-        auto resultToPort = [&](Value result) {
-          os << "<res" << getValuePortName(result) << "> ";
-          emitMlirOperand(os, result);
-          if (printResultTypes) {
-            os << " ";
-            emitMlirType(os, result.getType());
-          }
-        };
-        interleave(op->getResults(), os, resultToPort, "|");
+        emitResultPorts(os, op);
         os << "}";
       }
 
       os << "}";
+    });
+  }
+
+  /// Generate the label for the "input bar" of a region op: an "operands" label
+  /// followed by the operand ports, rendered as a horizontal bar near the top
+  /// of the region's cluster.
+  std::string getInputBarLabel(Operation *op) {
+    return strFromOs([&](raw_ostream &os) {
+      os << "operands|";
+      emitOperandPorts(os, op);
+    });
+  }
+
+  /// Generate the label for the "output bar" of a region op: a "results" label
+  /// followed by the result ports, rendered as a horizontal bar near the bottom
+  /// of the region's cluster.
+  std::string getOutputBarLabel(Operation *op) {
+    return strFromOs([&](raw_ostream &os) {
+      os << "results|";
+      emitResultPorts(os, op);
     });
   }
 
@@ -385,9 +450,13 @@ private:
   }
 
   /// Process a block. Emit a cluster and one node per block argument and
-  /// operation inside the cluster.
-  void processBlock(Block &block) {
-    emitClusterStmt([&]() {
+  /// operation inside the cluster. Return the cluster's anchor node and the node
+  /// of the block's last operation (its terminator); the latter falls back to
+  /// the anchor for an empty block.
+  BlockNodes processBlock(Block &block) {
+    Node lastNode;
+    bool hasLast = false;
+    Node anchor = emitClusterStmt([&]() {
       for (BlockArgument &blockArg : block.getArguments())
         valueToNode[blockArg] = emitNodeStmt(getLabel(blockArg));
       // Emit a node for each operation.
@@ -397,46 +466,144 @@ private:
         if (printControlFlowEdges && prevNode)
           emitEdgeStmt(*prevNode, nextNode, /*port=*/"", kLineStyleControlFlow);
         prevNode = nextNode;
+        lastNode = nextNode;
+        hasLast = true;
       }
     });
+    return {anchor, hasLast ? lastNode : anchor};
+  }
+
+  /// Emit a cluster for an operation that has regions. The op's operands are
+  /// shown as input ports on a record node ("input bar") near the top of the
+  /// cluster, and its results as output ports on a record node ("output bar")
+  /// near the bottom. The op title (name and attributes) is the cluster label,
+  /// anchored top-left.
+  ///
+  /// Two invisible edges per block (input bar -> block anchor, and the block's
+  /// terminator -> output bar) gently keep the region body between the bars, so
+  /// data flow tends to enter from the top and leave from the bottom,
+  /// preserving the top-to-bottom hierarchy of the graph. Pinning the output
+  /// bar below the terminator (rather than below the block anchor) keeps it at
+  /// the bottom edge even when the op has multiple regions. This is a soft
+  /// nudge, not strict pinning; the rest of the layout is left to GraphViz.
+  ///
+  /// Uses of an operand inside the region are routed through the input bar (see
+  /// `valueToInputBar`), so a value crosses the region boundary exactly once.
+  ///
+  /// Return a pair {input, output}: the node that consumes the op's operands
+  /// (top) and the node that produces the op's results (bottom). When the op
+  /// has no operands/results the corresponding node is an invisible anchor.
+  std::pair<Node, Node> emitRegionOpCluster(Operation *op) {
+    int clusterId = ++counter;
+    os << "subgraph cluster_" << clusterId << " {\n";
+    os.indent();
+    // Anchor the op title in the top-left corner of the region's box.
+    os << attrStmt("labeljust", quoteString("l")) << ";\n";
+    os << attrStmt("labelloc", quoteString("t")) << ";\n";
+    os << attrStmt("label", quoteString(getClusterLabel(op))) << ";\n";
+
+    // Input bar: operand ports near the top. Use an invisible anchor when the
+    // op has no operands so the cluster still has a representative node.
+    Node inputNode =
+        op->getNumOperands() > 0
+            ? emitNodeStmt(getInputBarLabel(op), kShapeNode,
+                           backgroundColors[op->getName()].second)
+            : emitNodeStmt(" ", kShapeNone);
+
+    // While emitting the region bodies, route uses of the op's operands through
+    // the input bar. Save and restore any outer mapping so nested region ops
+    // behave correctly.
+    SmallVector<std::pair<Value, std::optional<Node>>> savedInputBars;
+    for (Value operand : op->getOperands()) {
+      auto it = valueToInputBar.find(operand);
+      savedInputBars.emplace_back(operand, it != valueToInputBar.end()
+                                               ? std::optional<Node>(it->second)
+                                               : std::nullopt);
+      valueToInputBar[operand] = inputNode;
+    }
+
+    // Emit the region bodies and collect the per-block nodes so they can be
+    // ordered vertically between the input and output bars.
+    SmallVector<BlockNodes> blocks;
+    for (Region &region : op->getRegions())
+      llvm::append_range(blocks, processRegion(region));
+
+    for (auto &[operand, prev] : savedInputBars) {
+      if (prev)
+        valueToInputBar[operand] = *prev;
+      else
+        valueToInputBar.erase(operand);
+    }
+
+    // Output bar: result ports near the bottom, or an invisible anchor.
+    Node outputNode =
+        op->getNumResults() > 0
+            ? emitNodeStmt(getOutputBarLabel(op), kShapeNode,
+                           backgroundColors[op->getName()].second)
+            : emitNodeStmt(" ", kShapeNone);
+
+    // Softly keep the input bar above each block (via its anchor) and the
+    // output bar below each block (via its terminator) using invisible edges.
+    if (blocks.empty()) {
+      emitOrderingEdge(inputNode, outputNode);
+    } else {
+      for (const BlockNodes &block : blocks) {
+        emitOrderingEdge(inputNode, block.anchor);
+        emitOrderingEdge(block.last, outputNode);
+      }
+    }
+
+    os.unindent();
+    os << "}\n";
+    return {inputNode, outputNode};
   }
 
   /// Process an operation. If the operation has regions, emit a cluster.
   /// Otherwise, emit a node.
   Node processOperation(Operation *op) {
-    Node node;
+    // `sink` consumes the op's operands (top of the node/cluster); `source`
+    // produces the op's results (bottom). For ops without regions these are the
+    // same record node.
+    Node sink, source;
     if (op->getNumRegions() > 0) {
-      // Emit cluster for op with regions.
-      node = emitClusterStmt(
-          [&]() {
-            for (Region &region : op->getRegions())
-              processRegion(region);
-          },
-          getClusterLabel(op));
+      std::pair<Node, Node> anchors = emitRegionOpCluster(op);
+      sink = anchors.first;
+      source = anchors.second;
     } else {
-      node = emitNodeStmt(getRecordLabel(op), kShapeNode,
-                          backgroundColors[op->getName()].second);
+      Node node = emitNodeStmt(getRecordLabel(op), kShapeNode,
+                               backgroundColors[op->getName()].second);
+      sink = source = node;
     }
 
-    // Insert data flow edges originating from each operand.
+    // Insert data flow edges originating from each operand. If the operand is an
+    // operand of an enclosing region op, route the edge from that op's input
+    // bar instead of directly from the value's producer.
     if (printDataFlowEdges) {
       unsigned numOperands = op->getNumOperands();
       for (unsigned i = 0; i < numOperands; i++) {
-        auto operand = op->getOperand(i);
-        dataFlowEdges.push_back({operand, node, getValuePortName(operand)});
+        Value operand = op->getOperand(i);
+        auto it = valueToInputBar.find(operand);
+        if (it != valueToInputBar.end())
+          dataFlowEdges.push_back({operand, sink, getValuePortName(operand),
+                                   it->second, /*sourceUsesArgPort=*/true});
+        else
+          dataFlowEdges.push_back({operand, sink, getValuePortName(operand)});
       }
     }
 
     for (Value result : op->getResults())
-      valueToNode[result] = node;
+      valueToNode[result] = source;
 
-    return node;
+    return sink;
   }
 
-  /// Process a region.
-  void processRegion(Region &region) {
+  /// Process a region. Return the anchor and terminator node of each contained
+  /// block.
+  SmallVector<BlockNodes> processRegion(Region &region) {
+    SmallVector<BlockNodes> blocks;
     for (Block &block : region.getBlocks())
-      processBlock(block);
+      blocks.push_back(processBlock(block));
+    return blocks;
   }
 
   /// Truncate long strings.
@@ -453,6 +620,10 @@ private:
   std::vector<std::string> edges;
   /// Mapping of SSA values to Graphviz nodes/clusters.
   DenseMap<Value, Node> valueToNode;
+  /// Mapping of a region op's operand values to the op's input bar node, active
+  /// only while the op's regions are being emitted. Uses of these values inside
+  /// the region are routed through the input bar.
+  DenseMap<Value, Node> valueToInputBar;
   /// Output for data flow edges is delayed until the end to handle cycles
   std::vector<DataFlowEdge> dataFlowEdges;
   /// Counter for generating unique node/subgraph identifiers.
