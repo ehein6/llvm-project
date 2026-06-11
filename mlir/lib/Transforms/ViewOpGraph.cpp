@@ -91,7 +91,12 @@ public:
 struct DataFlowEdge {
   Value value;
   Node node;
-  std::string port;
+  /// Port on the source node (the `<res...>` port of the value's producer, or
+  /// the `<arg...>` port of an input bar). Identifies the value.
+  std::string srcPort;
+  /// Port on the consuming node. Identifies the specific operand slot, so that
+  /// passing the same value to several operands yields distinct ports.
+  std::string dstPort;
   /// If set, the edge originates from this node instead of the node that
   /// produces `value`. Used to route uses of a region op's operand through the
   /// op's input bar.
@@ -109,6 +114,10 @@ struct BlockNodes {
   Node anchor;
   Node last;
 };
+
+/// An input bar node together with the `<arg...>` port that a particular value
+/// occupies on it.
+using InputBarPort = std::pair<Node, std::string>;
 
 /// This pass generates a Graphviz dataflow visualization of an MLIR operation.
 /// Note: See https://www.graphviz.org/doc/info/lang.html for more information
@@ -168,7 +177,7 @@ private:
     if (printDataFlowEdges) {
       for (const auto &e : dataFlowEdges) {
         Node source = e.source ? *e.source : valueToNode[e.value];
-        emitEdgeStmt(source, e.node, e.port, kLineStyleDataFlow,
+        emitEdgeStmt(source, e.node, e.srcPort, e.dstPort, kLineStyleDataFlow,
                      e.sourceUsesArgPort);
       }
     }
@@ -257,11 +266,14 @@ private:
 
   /// Append an edge to the list of edges.
   /// Note: Edges are written to the output stream via `emitAllEdgeStmts`.
-  /// When `sourceUsesArgPort` is true, the edge leaves the source from its
-  /// `<arg...>` port (used when the source is a region op's input bar passing a
-  /// value down into the region) instead of its `<res...>` port.
-  void emitEdgeStmt(Node n1, Node n2, std::string port, StringRef style,
-                    bool sourceUsesArgPort = false) {
+  /// The edge leaves `n1` at `srcPort` and enters `n2` at `dstPort`. The source
+  /// and destination ports differ when the same value feeds several operands,
+  /// since each operand has its own (unique) input port. When
+  /// `sourceUsesArgPort` is true, the source attaches at its `<arg...>` port
+  /// (used when the source is a region op's input bar passing a value down into
+  /// the region) instead of its `<res...>` port.
+  void emitEdgeStmt(Node n1, Node n2, StringRef srcPort, StringRef dstPort,
+                    StringRef style, bool sourceUsesArgPort = false) {
     AttributeMap attrs;
     attrs["style"] = style.str();
     // Use `ltail` and `lhead` to draw edges between clusters.
@@ -272,17 +284,17 @@ private:
 
     edges.push_back(strFromOs([&](raw_ostream &os) {
       os << "v" << n1.id;
-      if (!port.empty() && !n1.clusterId) {
+      if (!srcPort.empty() && !n1.clusterId) {
         // Attach edge to the south compass point of the source port. An input
         // bar exposes the value on its `<arg...>` port; every other node
         // produces it on its `<res...>` port.
-        os << (sourceUsesArgPort ? ":arg" : ":res") << port << ":s";
+        os << (sourceUsesArgPort ? ":arg" : ":res") << srcPort << ":s";
       }
       os << " -> ";
       os << "v" << n2.id;
-      if (!port.empty() && !n2.clusterId)
+      if (!dstPort.empty() && !n2.clusterId)
         // Attach edge to north compass point of the operand
-        os << ":arg" << port << ":n";
+        os << ":arg" << dstPort << ":n";
       emitAttrList(os, attrs);
     }));
   }
@@ -336,6 +348,18 @@ private:
     return str;
   }
 
+  /// Port name for the operand at `index`. Normally the value's name, but when
+  /// the same value is passed to several operands it is suffixed with the
+  /// operand index so each operand slot gets a unique input port (otherwise all
+  /// edges would attach to the first such port).
+  std::string getOperandPortName(Operation *op, unsigned index) {
+    Value operand = op->getOperand(index);
+    std::string name = getValuePortName(operand);
+    if (llvm::count(op->getOperands(), operand) > 1)
+      name += "_" + std::to_string(index);
+    return name;
+  }
+
   /// Generate the label of a region op's cluster: the op name followed by its
   /// attributes. Each line ends with `\l` so that, together with the cluster's
   /// `labeljust = "l"` attribute, the label is anchored in the top-left corner.
@@ -358,10 +382,10 @@ private:
   /// input ports, e.g. `<arg_0> %a | <arg_1> %b`.
   void emitOperandPorts(raw_ostream &os, Operation *op) {
     interleave(
-        op->getOperands(), os,
-        [&](Value operand) {
-          os << "<arg" << getValuePortName(operand) << "> ";
-          emitMlirOperand(os, operand);
+        llvm::enumerate(op->getOperands()), os,
+        [&](auto operand) {
+          os << "<arg" << getOperandPortName(op, operand.index()) << "> ";
+          emitMlirOperand(os, operand.value());
         },
         "|");
   }
@@ -464,7 +488,8 @@ private:
       for (Operation &op : block) {
         Node nextNode = processOperation(&op);
         if (printControlFlowEdges && prevNode)
-          emitEdgeStmt(*prevNode, nextNode, /*port=*/"", kLineStyleControlFlow);
+          emitEdgeStmt(*prevNode, nextNode, /*srcPort=*/"", /*dstPort=*/"",
+                       kLineStyleControlFlow);
         prevNode = nextNode;
         lastNode = nextNode;
         hasLast = true;
@@ -511,15 +536,17 @@ private:
             : emitNodeStmt(" ", kShapeNone);
 
     // While emitting the region bodies, route uses of the op's operands through
-    // the input bar. Save and restore any outer mapping so nested region ops
-    // behave correctly.
-    SmallVector<std::pair<Value, std::optional<Node>>> savedInputBars;
-    for (Value operand : op->getOperands()) {
+    // the input bar (recording the bar node and the value's port on it). Save
+    // and restore any outer mapping so nested region ops behave correctly.
+    SmallVector<std::pair<Value, std::optional<InputBarPort>>> savedInputBars;
+    for (unsigned i = 0, e = op->getNumOperands(); i < e; ++i) {
+      Value operand = op->getOperand(i);
       auto it = valueToInputBar.find(operand);
-      savedInputBars.emplace_back(operand, it != valueToInputBar.end()
-                                               ? std::optional<Node>(it->second)
-                                               : std::nullopt);
-      valueToInputBar[operand] = inputNode;
+      savedInputBars.emplace_back(
+          operand, it != valueToInputBar.end()
+                       ? std::optional<InputBarPort>(it->second)
+                       : std::nullopt);
+      valueToInputBar[operand] = {inputNode, getOperandPortName(op, i)};
     }
 
     // Emit the region bodies and collect the per-block nodes so they can be
@@ -582,12 +609,17 @@ private:
       unsigned numOperands = op->getNumOperands();
       for (unsigned i = 0; i < numOperands; i++) {
         Value operand = op->getOperand(i);
+        std::string dstPort = getOperandPortName(op, i);
         auto it = valueToInputBar.find(operand);
         if (it != valueToInputBar.end())
-          dataFlowEdges.push_back({operand, sink, getValuePortName(operand),
-                                   it->second, /*sourceUsesArgPort=*/true});
+          // Route through the enclosing region op's input bar: source is that
+          // bar, using its `<arg...>` port for the value.
+          dataFlowEdges.push_back({operand, sink, it->second.second, dstPort,
+                                   it->second.first,
+                                   /*sourceUsesArgPort=*/true});
         else
-          dataFlowEdges.push_back({operand, sink, getValuePortName(operand)});
+          dataFlowEdges.push_back(
+              {operand, sink, getValuePortName(operand), dstPort});
       }
     }
 
@@ -620,10 +652,10 @@ private:
   std::vector<std::string> edges;
   /// Mapping of SSA values to Graphviz nodes/clusters.
   DenseMap<Value, Node> valueToNode;
-  /// Mapping of a region op's operand values to the op's input bar node, active
-  /// only while the op's regions are being emitted. Uses of these values inside
-  /// the region are routed through the input bar.
-  DenseMap<Value, Node> valueToInputBar;
+  /// Mapping of a region op's operand values to the op's input bar node and the
+  /// value's port on it, active only while the op's regions are being emitted.
+  /// Uses of these values inside the region are routed through the input bar.
+  DenseMap<Value, InputBarPort> valueToInputBar;
   /// Output for data flow edges is delayed until the end to handle cycles
   std::vector<DataFlowEdge> dataFlowEdges;
   /// Counter for generating unique node/subgraph identifiers.
